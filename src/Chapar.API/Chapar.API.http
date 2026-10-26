@@ -1,0 +1,6 @@
+@Chapar.API_HostAddress = http://localhost:5215
+
+GET {{Chapar.API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

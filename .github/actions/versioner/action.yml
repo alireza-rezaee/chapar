@@ -1,0 +1,51 @@
+name: 'Versioner Action'
+description: 'Calculate next semver using svu'
+
+outputs:
+  is_new:
+    description: "Is there a new version"
+    value: ${{ steps.semver.outputs.is_new }}
+  is_prerelease:
+    description: "Is this a prerelease"
+    value: ${{ steps.semver.outputs.is_prerelease }}
+  version:
+    description: "Calculated semver"
+    value: ${{ steps.semver.outputs.version }}
+  metadata:
+    description: "Build metadata"
+    value: ${{ steps.semver.outputs.metadata }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Semver
+      shell: bash
+      run: |
+        echo 'deb [trusted=yes] https://apt.fury.io/caarlos0/ /' | sudo tee /etc/apt/sources.list.d/caarlos0.list && \
+        sudo apt update && \
+        sudo apt install svu
+
+    - name: Get Next Version
+      id: semver
+      shell: bash
+      env:
+        BRANCH: ${{ github.ref_name }}
+      run: |
+        branch="${BRANCH,,}"
+        is_prerelease="false"
+        prerelease_args=()
+        if [[ "$branch" != "main" && "$branch" != "master" ]]; then
+          is_prerelease="true"
+          prerelease_args+=(--prerelease beta)
+        fi
+
+        version="$(svu next "${prerelease_args[@]}")"
+        [[ "$(svu current)" == "$version" ]] && is_new="false" || is_new="true"
+        metadata="sha.${GITHUB_SHA}"
+
+        {
+          echo "is_new=$is_new"
+          echo "is_prerelease=$is_prerelease"
+          echo "version=$version"
+          echo "metadata=$metadata"
+        } | tee -a "$GITHUB_OUTPUT"

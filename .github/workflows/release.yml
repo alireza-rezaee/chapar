@@ -1,0 +1,208 @@
+name: Release
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+      - '*.slnx'
+      - 'src/**'
+    branches:
+      - main
+      - dev
+
+jobs: 
+  tagger:
+    name: Tag
+    runs-on: ubuntu-latest
+
+    permissions:
+      checks: read
+      contents: write
+      id-token: write
+
+    outputs:
+      tag_name: ${{ steps.semver.outputs.version }}
+      is_prerelease: ${{ steps.semver.outputs.is_prerelease }}
+      app_version: ${{ steps.semver_norm.outputs.app_version }}
+      app_version_info: ${{ steps.semver_norm.outputs.app_version_info }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Wait Build to succeed
+        uses: lewagon/wait-on-check-action@v1.9.1
+        with:
+          ref: ${{ github.ref }}
+          check-regexp: '^(Versioner|\.NET Build & Test|Build Docker Image)$'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          allowed-conclusions: success
+
+      - name: Get Semver
+        id: semver
+        uses: ./.github/actions/versioner
+
+      - name: Create or Update
+        uses: actions/github-script@v9
+        env:
+          TAG: ${{ steps.semver.outputs.version }}
+        with:
+          script: |
+            const { TAG } = process.env;
+            const ref = `tags/${TAG}`;
+
+            try {
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/${ref}`,
+                sha: context.sha
+              });
+              console.log(`Successfully created tag ${TAG}`);
+
+            } catch (error) {
+              if (error.status === 422 || error.message.includes('Reference already exists')) {
+                console.log(`Tag ${TAG} already exists. Updating to ${context.sha}...`);
+                await github.rest.git.updateRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: ref,
+                  sha: context.sha,
+                  force: true
+                });
+                console.log(`Successfully updated tag ${TAG}`);
+              } else {
+                throw error;
+              }
+            }
+
+      - name: Normalize Version
+        id: semver_norm
+        run: |
+          VERSION="${{ steps.semver.outputs.version }}"
+          APP_VERSION="${VERSION#v}"
+          APP_VERSION_INFO="${APP_VERSION}+${{ steps.semver.outputs.metadata }}"
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "app_version_info=${APP_VERSION_INFO}" >> "$GITHUB_OUTPUT"
+
+  gh-release:
+    name: GitHub Release
+    needs: [tagger]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+          dotnet-quality: 'ga'
+          cache: true
+          cache-dependency-path: |
+            src/**/*.csproj
+            **/packages.lock.json
+
+      - name: Restore
+        run: |
+          dotnet restore \
+            --runtime linux-x64
+          mkdir -p ~/.nuget/packages
+
+      - name: Publish
+        env:
+          version: ${{ needs.tagger.outputs.app_version }}
+          version_info: ${{ needs.tagger.outputs.app_version_info }}
+        run: |
+          dotnet publish src/Chapar.API \
+            --no-restore \
+            --configuration Release \
+            --runtime linux-x64 \
+            --output artifacts/Chapar.API.linux-x64 \
+            -p:Version="1.0.0" \
+            -p:InformationalVersion="1.0.0+build" \
+            -p:StripSymbols=true \
+            -p:DebugType=None \
+            -p:DebugSymbols=false \
+            && (cd artifacts && zip -rq Chapar.API.linux-x64.zip Chapar.API.linux-x64)
+
+          dotnet publish src/Chapar.API \
+            --no-restore \
+            --configuration Release \
+            --runtime linux-x64 \
+            --output artifacts/Chapar.API.linux-x64-debug \
+            -p:Version="1.0.0" \
+            -p:InformationalVersion="1.0.0+build" \
+            -p:StripSymbols=false \
+            -p:DebugType=portable \
+            -p:DebugSymbols=true \
+            && (cd artifacts && zip -rq Chapar.API.linux-x64-debug.zip Chapar.API.linux-x64-debug)
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IS_PRERELEASE: ${{ fromJSON(needs.tagger.outputs.is_prerelease) }}
+          TAG: "${{ needs.tagger.outputs.tag_name }}"
+        run: |
+          PRERELEASE_ARGS=()
+          if [[ "$IS_PRERELEASE" == true ]]; then
+            PRERELEASE_ARGS+=(--prerelease)
+          fi
+
+          gh release create \
+            "$TAG" \
+            artifacts/Chapar.API*.zip \
+            "${PRERELEASE_ARGS[@]}" \
+            --title "$TAG" \
+            --generate-notes
+
+  docker:
+    name: Docker Image
+    needs: [tagger]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    env:
+      IMAGE_NAME: ghcr.io/alireza-rezaee/chapar-api
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and Push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: src/Chapar.API
+          push: true
+          build-args: |
+            APP_VERSION=${{ needs.tagger.outputs.app_version }}
+            APP_INFO_VERSION=${{ needs.tagger.outputs.app_version_info }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ needs.tagger.outputs.app_version }}
